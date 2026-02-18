@@ -1,0 +1,98 @@
+[
+  {
+    "id": 1,
+    "name": "Republic Day",
+    "date": "2026-01-26",
+    "day": "Monday"
+  },
+  {
+    "id": 2,
+    "name": "Maha Shivaratri",
+    "date": "2026-02-26",
+    "day": "Thursday"
+  },
+  {
+    "id": 3,
+    "name": "Holi",
+    "date": "2026-03-14",
+    "day": "Saturday"
+  },
+  {
+    "id": 4,
+    "name": "Good Friday",
+    "date": "2026-04-18",
+    "day": "Friday"
+  },
+  {
+    "id": 5,
+    "name": "Easter Monday",
+    "date": "2026-04-21",
+    "day": "Monday"
+  },
+  {
+    "id": 6,
+    "name": "May Day",
+    "date": "2026-05-01",
+    "day": "Friday"
+  },
+  {
+    "id": 7,
+    "name": "Buddha Purnima",
+    "date": "2026-05-12",
+    "day": "Tuesday"
+  },
+  {
+    "id": 8,
+    "name": "Independence Day",
+    "date": "2026-08-15",
+    "day": "Saturday"
+  },
+  {
+    "id": 9,
+    "name": "Janmashtami",
+    "date": "2026-08-17",
+    "day": "Monday"
+  },
+  {
+    "id": 10,
+    "name": "Ganesh Chaturthi",
+    "date": "2026-09-07",
+    "day": "Monday"
+  },
+  {
+    "id": 11,
+    "name": "Mahatma Gandhi Jayanti",
+    "date": "2026-10-02",
+    "day": "Friday"
+  },
+  {
+    "id": 12,
+    "name": "Dussehra",
+    "date": "2026-10-04",
+    "day": "Sunday"
+  },
+  {
+    "id": 13,
+    "name": "Diwali",
+    "date": "2026-10-20",
+    "day": "Tuesday"
+  },
+  {
+    "id": 14,
+    "name": "Diwali (Bali Pratipada)",
+    "date": "2026-10-21",
+    "day": "Wednesday"
+  },
+  {
+    "id": 15,
+    "name": "Bhai Dooj",
+    "date": "2026-10-22",
+    "day": "Thursday"
+  },
+  {
+    "id": 16,
+    "name": "Christmas Day",
+    "date": "2026-12-25",
+    "day": "Friday"
+  }
+]

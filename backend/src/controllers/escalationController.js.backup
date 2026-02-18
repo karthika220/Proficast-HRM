@@ -1,0 +1,931 @@
+const prisma = require('../prismaClient');
+
+// Helper function to create notification
+const createNotification = async (userId, title, message, type) => {
+  try {
+    await prisma.notification.create({
+      data: {
+        userId,
+        title,
+        message,
+        type,
+      },
+    });
+  } catch (error) {
+    console.error('Error creating notification:', error);
+  }
+};
+
+// Get escalations based on user role
+const getEscalations = async (req, res) => {
+  try {
+    const { id: userId, role } = req.user;
+    const { status, severity, type, limit = 50, offset = 0 } = req.query;
+
+    let whereClause = {};
+
+    // Managers can see escalations for their team members
+    if (role === "MANAGER") {
+      const teamMembers = await prisma.user.findMany({
+        where: { reportingManagerId: userId },
+        select: { id: true },
+      });
+      const teamMemberIds = teamMembers.map(member => member.id);
+      whereClause.userId = { in: teamMemberIds };
+    }
+
+    // HR and MD can see all escalations
+    if (role === "HR" || role === "MD") {
+      // No restriction on userId
+    } else if (role === "EMPLOYEE") {
+      // Employees can only see their own escalations
+      whereClause.userId = userId;
+    }
+
+    // Apply filters
+    if (status) {
+      whereClause.status = status;
+    }
+    if (severity) {
+      whereClause.severity = severity;
+    }
+    if (type) {
+      whereClause.type = type;
+    }
+
+    const escalations = await prisma.escalation.findMany({
+      where: whereClause,
+      orderBy: {
+        createdAt: "desc",
+      },
+      take: parseInt(limit),
+      skip: parseInt(offset),
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            employeeId: true,
+            reportingManager: {
+              select: {
+                id: true,
+                fullName: true,
+                email: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    res.json({
+      count: escalations.length,
+      escalations,
+    });
+  } catch (error) {
+    console.error("Get escalations error:", error);
+    res.status(500).json({
+      error: "Failed to fetch escalations",
+      details: error.message,
+    });
+  }
+};
+
+// Create escalation (for HR/Manager use)
+const createEscalation = async (req, res) => {
+  try {
+    const { id: creatorId, role } = req.user;
+    const { userId, type, severity, description, notes } = req.body;
+
+    // Only HR, MD, and Managers can create escalations
+    if (!["HR", "MD", "MANAGER"].includes(role)) {
+      return res.status(403).json({
+        error: "Forbidden: Only HR, MD, and Managers can create escalations",
+      });
+    }
+
+    // Validate input
+    if (!userId || !type || !severity || !description) {
+      return res.status(400).json({
+        error: "Missing required fields: userId, type, severity, description",
+      });
+    }
+
+    // Check permissions for manager
+    if (role === "MANAGER") {
+      const employee = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { reportingManagerId: true }
+      });
+      
+      if (!employee || employee.reportingManagerId !== creatorId) {
+        return res.status(403).json({
+          error: "Forbidden: You can only create escalations for your direct reports",
+        });
+      }
+    }
+
+    // Validate escalation type and severity
+    const validTypes = ['ABSENCE', 'LATENESS', 'PERFORMANCE', 'CONDUCT', 'OTHER'];
+    const validSeverities = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
+
+    if (!validTypes.includes(type)) {
+      return res.status(400).json({
+        error: `Invalid type. Must be one of: ${validTypes.join(', ')}`,
+      });
+    }
+
+    if (!validSeverities.includes(severity)) {
+      return res.status(400).json({
+        error: `Invalid severity. Must be one of: ${validSeverities.join(', ')}`,
+      });
+    }
+
+    // Check if similar escalation already exists and is open
+    const existingEscalation = await prisma.escalation.findFirst({
+      where: {
+        userId,
+        type,
+        status: {
+          in: ['OPEN', 'IN_PROGRESS'],
+        },
+      },
+    });
+
+    if (existingEscalation) {
+      return res.status(400).json({
+        error: `An active ${type.toLowerCase()} escalation already exists for this employee`,
+        existingEscalation,
+      });
+    }
+
+    // Create escalation
+    const escalation = await prisma.escalation.create({
+      data: {
+        userId,
+        type,
+        severity,
+        description,
+        notes: notes || null,
+        triggeredBy: role,
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            employeeId: true,
+            reportingManager: {
+              select: {
+                id: true,
+                fullName: true,
+                email: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    // Notify relevant parties
+    const user = escalation.user;
+
+    // Notify HR
+    const hrUsers = await prisma.user.findMany({
+      where: { role: 'HR' },
+      select: { id: true }
+    });
+
+    for (const hr of hrUsers) {
+      await createNotification(
+        hr.id,
+        'New Escalation',
+        `${severity} ${type.toLowerCase()} escalation created for ${user.fullName}: ${description}`,
+        'ESCALATION'
+      );
+    }
+
+    // Notify manager (if not created by manager)
+    if (user.reportingManager && user.reportingManager.id !== creatorId) {
+      await createNotification(
+        user.reportingManager.id,
+        'New Escalation',
+        `${severity} ${type.toLowerCase()} escalation created for ${user.fullName}: ${description}`,
+        'ESCALATION'
+      );
+    }
+
+    res.status(201).json({
+      message: "Escalation created successfully",
+      escalation,
+    });
+  } catch (error) {
+    console.error("Create escalation error:", error);
+    res.status(500).json({
+      error: "Failed to create escalation",
+      details: error.message,
+    });
+  }
+};
+
+// Update escalation (resolve or update status)
+const updateEscalation = async (req, res) => {
+  try {
+    const { id: userId, role } = req.user;
+    const { escalationId } = req.params;
+    const { status, notes } = req.body;
+
+    // Only HR, MD, and Managers can update escalations
+    if (!["HR", "MD", "MANAGER"].includes(role)) {
+      return res.status(403).json({
+        error: "Forbidden: Only HR, MD, and Managers can update escalations",
+      });
+    }
+
+    // Validate status
+    const validStatuses = ['OPEN', 'IN_PROGRESS', 'RESOLVED'];
+    if (status && !validStatuses.includes(status)) {
+      return res.status(400).json({
+        error: `Invalid status. Must be one of: ${validStatuses.join(', ')}`,
+      });
+    }
+
+    const escalation = await prisma.escalation.findUnique({
+      where: { id: escalationId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            employeeId: true,
+            reportingManager: {
+              select: {
+                id: true,
+                fullName: true,
+                email: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!escalation) {
+      return res.status(404).json({
+        error: "Escalation not found",
+      });
+    }
+
+    // Check permissions for manager
+    if (role === "MANAGER") {
+      if (escalation.user.reportingManager?.id !== userId) {
+        return res.status(403).json({
+          error: "Forbidden: You can only update escalations for your direct reports",
+        });
+      }
+    }
+
+    // Prepare update data
+    const updateData = {};
+    if (status) {
+      updateData.status = status;
+      
+      // If resolving, set resolution details
+      if (status === 'RESOLVED') {
+        updateData.resolvedAt = new Date();
+        updateData.resolvedBy = userId;
+      }
+    }
+    if (notes !== undefined) {
+      updateData.notes = notes;
+    }
+
+    const updatedEscalation = await prisma.escalation.update({
+      where: { id: escalationId },
+      data: updateData,
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            employeeId: true,
+            reportingManager: {
+              select: {
+                id: true,
+                fullName: true,
+                email: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    // Notify relevant parties of status change
+    if (status && status !== escalation.status) {
+      const user = updatedEscalation.user;
+
+      // Notify HR
+      const hrUsers = await prisma.user.findMany({
+        where: { role: 'HR' },
+        select: { id: true }
+      });
+
+      for (const hr of hrUsers) {
+        await createNotification(
+          hr.id,
+          'Escalation Update',
+          `${user.fullName}'s ${escalation.type.toLowerCase()} escalation status updated to: ${status}`,
+          'ESCALATION'
+        );
+      }
+
+      // Notify manager
+      if (user.reportingManager) {
+        await createNotification(
+          user.reportingManager.id,
+          'Escalation Update',
+          `${user.fullName}'s ${escalation.type.toLowerCase()} escalation status updated to: ${status}`,
+          'ESCALATION'
+        );
+      }
+    }
+
+    res.json({
+      message: "Escalation updated successfully",
+      escalation: updatedEscalation,
+    });
+  } catch (error) {
+    console.error("Update escalation error:", error);
+    res.status(500).json({
+      error: "Failed to update escalation",
+      details: error.message,
+    });
+  }
+};
+
+// Get escalation statistics
+const getEscalationStatistics = async (req, res) => {
+  try {
+    const { id: userId, role } = req.user;
+    const { year } = req.query;
+    
+    const currentYear = year ? parseInt(year) : new Date().getFullYear();
+    const startDate = new Date(currentYear, 0, 1);
+    const endDate = new Date(currentYear, 11, 31, 23, 59, 59, 999);
+
+    let whereClause = {
+      createdAt: {
+        gte: startDate,
+        lte: endDate,
+      },
+    };
+
+    // Managers can see team statistics
+    if (role === "MANAGER") {
+      const teamMembers = await prisma.user.findMany({
+        where: { reportingManagerId: userId },
+        select: { id: true },
+      });
+      const teamMemberIds = teamMembers.map(member => member.id);
+      whereClause.userId = { in: teamMemberIds };
+    }
+
+    // HR and MD can see all statistics
+    if (role === "HR" || role === "MD") {
+      // No restriction
+    } else if (role === "EMPLOYEE") {
+      // Employees can only see their own statistics
+      whereClause.userId = userId;
+    }
+
+    const escalations = await prisma.escalation.findMany({
+      where: whereClause,
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            employeeId: true,
+          },
+        },
+      },
+    });
+
+    // Calculate statistics
+    const stats = {
+      total: escalations.length,
+      open: escalations.filter(e => e.status === 'OPEN').length,
+      inProgress: escalations.filter(e => e.status === 'IN_PROGRESS').length,
+      resolved: escalations.filter(e => e.status === 'RESOLVED').length,
+      byType: {
+        ABSENCE: escalations.filter(e => e.type === 'ABSENCE').length,
+        LATENESS: escalations.filter(e => e.type === 'LATENESS').length,
+        PERFORMANCE: escalations.filter(e => e.type === 'PERFORMANCE').length,
+        CONDUCT: escalations.filter(e => e.type === 'CONDUCT').length,
+        OTHER: escalations.filter(e => e.type === 'OTHER').length,
+      },
+      bySeverity: {
+        LOW: escalations.filter(e => e.severity === 'LOW').length,
+        MEDIUM: escalations.filter(e => e.severity === 'MEDIUM').length,
+        HIGH: escalations.filter(e => e.severity === 'HIGH').length,
+        CRITICAL: escalations.filter(e => e.severity === 'CRITICAL').length,
+      },
+      averageResolutionTime: 0, // in days
+    };
+
+    // Calculate average resolution time
+    const resolvedEscalations = escalations.filter(e => e.status === 'RESOLVED' && e.resolvedAt);
+    if (resolvedEscalations.length > 0) {
+      const totalResolutionTime = resolvedEscalations.reduce((sum, e) => {
+        const resolutionTime = (e.resolvedAt - e.createdAt) / (1000 * 60 * 60 * 24); // days
+        return sum + resolutionTime;
+      }, 0);
+      stats.averageResolutionTime = Math.round(totalResolutionTime / resolvedEscalations.length * 10) / 10;
+    }
+
+    res.json({
+      year: currentYear,
+      statistics: stats,
+    });
+  } catch (error) {
+    console.error("Get escalation statistics error:", error);
+    res.status(500).json({
+      error: "Failed to fetch escalation statistics",
+      details: error.message,
+    });
+  }
+};
+
+// Get escalations dashboard summary
+const getEscalationDashboard = async (req, res) => {
+  try {
+    const { id: userId, role } = req.user;
+
+    let whereClause = {};
+
+    // Managers can see team escalations
+    if (role === "MANAGER") {
+      const teamMembers = await prisma.user.findMany({
+        where: { reportingManagerId: userId },
+        select: { id: true },
+      });
+      const teamMemberIds = teamMembers.map(member => member.id);
+      whereClause.userId = { in: teamMemberIds };
+    }
+
+    // HR and MD can see all escalations
+    if (role === "HR" || role === "MD") {
+      // No restriction
+    } else if (role === "EMPLOYEE") {
+      // Employees can only see their own escalations
+      whereClause.userId = userId;
+    }
+
+    // Get recent escalations
+    const recentEscalations = await prisma.escalation.findMany({
+      where: whereClause,
+      orderBy: {
+        createdAt: "desc",
+      },
+      take: 10,
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            employeeId: true,
+          },
+        },
+      },
+    });
+
+    // Get escalation counts by status
+    const statusCounts = await prisma.escalation.groupBy({
+      by: ['status'],
+      where: whereClause,
+      _count: {
+        status: true,
+      },
+    });
+
+    // Get escalation counts by severity
+    const severityCounts = await prisma.escalation.groupBy({
+      by: ['severity'],
+      where: whereClause,
+      _count: {
+        severity: true,
+      },
+    });
+
+    const dashboard = {
+      recentEscalations,
+      statusCounts: statusCounts.reduce((acc, item) => {
+        acc[item.status] = item._count.status;
+        return acc;
+      }, {}),
+      severityCounts: severityCounts.reduce((acc, item) => {
+        acc[item.severity] = item._count.severity;
+        return acc;
+      }, {}),
+    };
+
+    res.json(dashboard);
+  } catch (error) {
+    console.error("Get escalation dashboard error:", error);
+    res.status(500).json({
+      error: "Failed to fetch escalation dashboard",
+      details: error.message,
+    });
+  }
+};
+
+// Get grouped escalations for TL/HR/MD view
+const getGroupedEscalations = async (req, res) => {
+  try {
+    const { id: userId, role } = req.user;
+
+    // Check if user has access (TL, HR, MD)
+    if (role !== 'TL' && role !== 'HR' && role !== 'MD' && role !== 'MANAGER') {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied'
+      });
+    }
+
+    // Get all employees grouped by team/department
+    const employees = await prisma.user.findMany({
+      where: {
+        status: 'Active'
+      },
+      select: {
+        id: true,
+        fullName: true,
+        email: true,
+        role: true,
+        department: true,
+        employeeId: true,
+        reportingManagerId: true,
+        reportingManager: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            role: true
+          }
+        }
+      },
+      orderBy: [
+        { department: 'asc' },
+        { role: 'asc' }
+      ]
+    });
+
+    // Group employees by team/department
+    const groupedData = {};
+    
+    employees.forEach(emp => {
+      const team = emp.department || 'General';
+      
+      if (!groupedData[team]) {
+        groupedData[team] = {
+          team,
+          teamLead: emp.reportingManager || null,
+          employees: [],
+          escalations: []
+        };
+      }
+      
+      groupedData[team].employees.push({
+        id: emp.id,
+        name: emp.fullName,
+        email: emp.email,
+        role: emp.role,
+        employeeId: emp.employeeId,
+        team: emp.department || 'General'
+      });
+    });
+
+    // Get escalations for each team
+    for (const team of Object.keys(groupedData)) {
+      const teamEmployees = groupedData[team].employees.map(emp => emp.id);
+      
+      const escalations = await prisma.escalation.findMany({
+        where: {
+          employeeId: {
+            in: teamEmployees
+          },
+          status: 'OPEN'
+        },
+        include: {
+          raisedByUser: {
+            select: {
+              fullName: true,
+              email: true,
+              role: true
+            }
+          }
+        },
+        orderBy: {
+          createdAt: 'desc'
+        }
+      });
+
+      // Transform to match expected format
+      groupedData[team].escalations = escalations.map(esc => ({
+        id: esc.id,
+        employeeId: esc.employeeId,
+        employeeName: groupedData[team].employees.find(emp => emp.id === esc.employeeId)?.name,
+        reason: esc.reason,
+        severity: esc.severity,
+        status: esc.status,
+        count: esc.count,
+        createdAt: esc.createdAt,
+        raisedBy: { fullName: esc.raisedByUser?.fullName, email: esc.raisedByUser?.email }
+      }));
+    }
+
+    res.json({
+      success: true,
+      data: Object.values(groupedData)
+    });
+
+  } catch (error) {
+    console.error('Get grouped escalations error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch escalations',
+      details: error.message
+    });
+  }
+};
+
+// Create escalation with counter logic
+const createEscalation = async (req, res) => {
+  try {
+    const { id: userId, role } = req.user;
+    const { employeeId, reason, severity = 'MEDIUM', notifyEmployee = false } = req.body;
+
+    // Check if user has access (TL, HR, MD)
+    if (role !== 'TL' && role !== 'HR' && role !== 'MD' && role !== 'MANAGER') {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied'
+      });
+    }
+
+    // Get employee details
+    const employee = await prisma.user.findUnique({
+      where: { id: employeeId },
+      select: { id: true, fullName: true, email: true, reportingManagerId: true }
+    });
+
+    if (!employee) {
+      return res.status(404).json({
+        success: false,
+        message: 'Employee not found'
+      });
+    }
+
+    // Check if TL can escalate this employee
+    if (role === 'TL' && employee.reportingManagerId !== userId) {
+      return res.status(403).json({
+        success: false,
+        message: 'You can only escalate your team members'
+      });
+    }
+
+    // Count existing escalations for this employee
+    const existingEscalations = await prisma.escalation.findMany({
+      where: {
+        employeeId: employeeId,
+        status: 'OPEN'
+      }
+    });
+
+    const newCount = existingEscalations.length + 1;
+
+    // Create new escalation
+    const escalation = await prisma.escalation.create({
+      data: {
+        employeeId,
+        raisedById: userId,
+        reason,
+        severity,
+        count: newCount,
+        status: 'OPEN'
+      },
+      include: {
+        raisedByUser: {
+          select: {
+            fullName: true,
+            email: true
+          }
+        }
+      }
+    });
+
+    // Check if count >= 3 and take action
+    if (newCount >= 3) {
+      // Mark employee as under review
+      await prisma.user.update({
+        where: { id: employeeId },
+        data: { status: 'Under Review' }
+      });
+
+      // Send notifications (console log for now)
+      console.log(`🚨 ESCALATION THRESHOLD REACHED: ${employee.fullName} has ${newCount} escalations`);
+      console.log(`📧 Notify Employee: ${employee.email}`);
+      console.log(`📧 Notify HR: hr@company.com`);
+      console.log(`📧 Notify TL: ${req.user.email}`);
+
+      // Create notification records
+      await createNotification(employeeId, 'Escalation Threshold Reached', `You have reached ${newCount} escalations and are under review.`, 'ESCALATION');
+      
+      // Notify HR users
+      const hrUsers = await prisma.user.findMany({
+        where: { role: 'HR' },
+        select: { id: true }
+      });
+      
+      for (const hrUser of hrUsers) {
+        await createNotification(hrUser.id, 'Escalation Threshold Reached', `${employee.fullName} has reached ${newCount} escalations.`, 'ESCALATION');
+      }
+
+      // Notify TL if not the one who escalated
+      if (employee.reportingManagerId && employee.reportingManagerId !== userId) {
+        await createNotification(employee.reportingManagerId, 'Escalation Threshold Reached', `${employee.fullName} has reached ${newCount} escalations.`, 'ESCALATION');
+      }
+    }
+
+    // Notify employee if requested
+    if (notifyEmployee) {
+      await createNotification(employeeId, 'New Escalation', `You have been escalated: ${reason}`, 'ESCALATION');
+    }
+
+    res.json({
+      success: true,
+      data: {
+        id: escalation.id,
+        employeeId: escalation.employeeId,
+        employeeName: employee.fullName,
+        reason: escalation.reason,
+        severity: escalation.severity,
+        status: escalation.status,
+        count: escalation.count,
+        createdAt: escalation.createdAt,
+        raisedBy: { fullName: escalation.raisedByUser?.fullName, email: escalation.raisedByUser?.email }
+      }
+    });
+
+  } catch (error) {
+    console.error('Create escalation error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create escalation',
+      details: error.message
+    });
+  }
+};
+
+// Get employee escalation history
+const getEmployeeEscalationHistory = async (req, res) => {
+  try {
+    const { id: userId, role } = req.user;
+    const { employeeId } = req.params;
+
+    // Check access
+    if (role === 'EMPLOYEE' && employeeId !== userId) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied'
+      });
+    }
+
+    const escalations = await prisma.escalation.findMany({
+      where: {
+        employeeId: employeeId
+      },
+      include: {
+        raisedByUser: {
+          select: {
+            fullName: true,
+            email: true,
+            role: true
+          }
+        }
+      },
+      orderBy: {
+        createdAt: 'desc'
+      }
+    });
+
+    const employee = await prisma.user.findUnique({
+      where: { id: employeeId },
+      select: { fullName: true, email: true, role: true, status: true }
+    });
+
+    res.json({
+      success: true,
+      data: {
+        employee,
+        escalations: escalations.map(esc => ({
+          id: esc.id,
+          reason: esc.reason,
+          severity: esc.severity,
+          status: esc.status,
+          count: esc.count,
+          createdAt: esc.createdAt,
+          raisedBy: { fullName: esc.raisedByUser?.fullName, email: esc.raisedByUser?.email }
+        }))
+      }
+    });
+
+  } catch (error) {
+    console.error('Get employee escalation history error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch escalation history',
+      details: error.message
+    });
+  }
+};
+
+// Get escalation summary statistics
+const getEscalationSummary = async (req, res) => {
+  try {
+    const { id: userId, role } = req.user;
+
+    let whereClause = {};
+
+    // Role-based filtering
+    if (role === 'EMPLOYEE') {
+      whereClause.employeeId = userId;
+    } else if (role === 'TL') {
+      // Get TL's team members
+      const teamMembers = await prisma.user.findMany({
+        where: { reportingManagerId: userId },
+        select: { id: true }
+      });
+      whereClause.employeeId = { in: teamMembers.map(m => m.id) };
+    }
+    // HR, MD, MANAGER can see all
+
+    const totalEmployees = await prisma.user.count({
+      where: { status: 'Active' }
+    });
+
+    const activeEscalations = await prisma.escalation.count({
+      where: {
+        status: 'OPEN',
+        ...whereClause
+      }
+    });
+
+    const underReviewEmployees = await prisma.user.count({
+      where: { status: 'Under Review' }
+    });
+
+    const resolvedEscalations = await prisma.escalation.count({
+      where: {
+        status: 'RESOLVED',
+        ...whereClause
+      }
+    });
+
+    res.json({
+      success: true,
+      data: {
+        totalEmployees,
+        activeEscalations,
+        underReviewEmployees,
+        resolvedEscalations
+      }
+    });
+
+  } catch (error) {
+    console.error('Get escalation summary error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch escalation summary',
+      details: error.message
+    });
+  }
+};
+
+module.exports = {
+  getEscalations,
+  createEscalation,
+  updateEscalation,
+  getEscalationStatistics,
+  getEscalationDashboard,
+  getGroupedEscalations,
+  getEmployeeEscalationHistory,
+  getEscalationSummary,
+};

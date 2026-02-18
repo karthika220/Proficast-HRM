@@ -1,0 +1,7 @@
+-- AlterTable
+ALTER TABLE "LeaveBalance" ALTER COLUMN "updatedAt" DROP DEFAULT,
+ALTER COLUMN "yearJoined" DROP DEFAULT;
+
+-- AlterTable
+ALTER TABLE "Notification" ALTER COLUMN "title" DROP DEFAULT,
+ALTER COLUMN "type" DROP DEFAULT;
