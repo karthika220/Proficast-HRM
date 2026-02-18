@@ -35,7 +35,7 @@ const getTodayAttendanceLive = async (req, res) => {
             employeeId: true,
             department: true,
             designation: true,
-            reportingManager: {
+            User: {
               select: {
                 fullName: true
               }
@@ -62,7 +62,7 @@ const getTodayAttendanceLive = async (req, res) => {
         employeeId: true,
         department: true,
         designation: true,
-        reportingManager: {
+        User: {
           select: {
             fullName: true
           }
